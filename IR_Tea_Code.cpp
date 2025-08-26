@@ -7,10 +7,10 @@
 #include "Arduino_LED_Matrix.h"
 
 // --- WiFi and ThingsBoard Configuration ---
-const char* WLAN_SSID = "";
-const char* WLAN_PASS = "";
-#define TOKEN ""
-#define THINGSBOARD_SERVER ""
+const char* WLAN_SSID = " ";
+const char* WLAN_PASS = " ";
+#define TOKEN " "
+#define THINGSBOARD_SERVER " "
 #define THINGSBOARD_SERVERPORT 1883
 
 // --- Matrix Display Class ---
@@ -55,7 +55,7 @@ MatrixDisplay ledDisplay;
 // --- Pin Definitions ---
 const byte irSensorPin_Tea = 11;
 const byte irSensorPin_Honey = 12;
-const byte switchPin = 8;
+//const byte switchPin = 8;
 const byte relayPin_TeaMaterial = 2;
 const byte relayPin_HoneyMaterial = 4;
 const byte relayPin_SealBag = 3;
@@ -134,16 +134,16 @@ void setup() {
 
     pinMode(irSensorPin_Tea, INPUT_PULLUP);
     pinMode(irSensorPin_Honey, INPUT_PULLUP);
-    pinMode(switchPin, INPUT_PULLUP);
+    pinMode(8, INPUT_PULLUP);
     pinMode(relayPin_TeaMaterial, OUTPUT);
     pinMode(relayPin_HoneyMaterial, OUTPUT);
     pinMode(relayPin_SealBag, OUTPUT);
-    pinMode(Gate, OUTPUT);
+    //pinMode(Gate, OUTPUT);
 
     digitalWrite(relayPin_TeaMaterial, HIGH);
     digitalWrite(relayPin_HoneyMaterial, HIGH);
     digitalWrite(relayPin_SealBag, HIGH);
-    digitalWrite(Gate, HIGH);
+    //digitalWrite(Gate, HIGH);
 
     attachInterrupt(digitalPinToInterrupt(irSensorPin_Tea), teaSensorISR, FALLING);
     attachInterrupt(digitalPinToInterrupt(irSensorPin_Honey), honeySensorISR, FALLING);
@@ -182,9 +182,14 @@ void loop() {
     }
     ledDisplay.clear();
 
+    if(digitalRead(8)==LOW)
+    {
+
     if (!sequenceInProgress) {
         sequenceInProgress = true;
         Serial.println("Starting material dispensing sequence...");
+        digitalWrite(relayPin_TeaMaterial, LOW);
+        digitalWrite(relayPin_SealBag, LOW);
 
         teaRelayRunning = (TeaState == 0);
         honeyRelayRunning = (HoneyState == 0);
@@ -246,7 +251,7 @@ void loop() {
 
             ++count;
             ++total_Count;
-            publishTelemetry();
+            publishTelemetry(); // turn off temp to gave ding instead of 25 dings
             if (count >= 24) {
                 count = 0;
                 ++batch;
@@ -263,6 +268,7 @@ void loop() {
         honeySensorTriggered = false;
         sequenceInProgress = false;
         delay(2500);
+    }
     }
 
     static unsigned long lastDebugPrint = 0;
