@@ -1,290 +1,280 @@
-
 // --- Libraries ---
 #include <WiFiS3.h>
 #include "PubSubClient.h"
 #include <ArduinoJson.h>
-#include "ArduinoGraphics.h"
-#include "Arduino_LED_Matrix.h"
+#include "config.h" // Includes all settings from your config.h file
 
-// --- WiFi and ThingsBoard Configuration ---
-const char* WLAN_SSID = " ";
-const char* WLAN_PASS = " ";
-#define TOKEN " "
-#define THINGSBOARD_SERVER " "
-#define THINGSBOARD_SERVERPORT 1883
-
-// --- Matrix Display Class ---
-class MatrixDisplay {
-public:
-    MatrixDisplay() {}
-    void begin(const char* staticText = "UNO r4") {
-        matrix.begin();
-        matrix.beginDraw();
-        matrix.stroke(0xFFFFFFFF);
-        matrix.textFont(Font_4x6);
-        matrix.beginText(0, 1, 0xFFFFFF);
-        matrix.println(staticText);
-        matrix.endText();
-        matrix.endDraw();
-        delay(2000);
-    }
-    void updateScroll(const char* message, unsigned long scrollSpeed = 70) {
-        matrix.beginDraw();
-        matrix.stroke(0xFFFFFFFF);
-        matrix.textScrollSpeed(scrollSpeed);
-        matrix.textFont(Font_5x7);
-        matrix.beginText(0, 1, 0xFFFFFF);
-        matrix.println(message);
-        matrix.endText(SCROLL_LEFT);
-        matrix.endDraw();
-    }
-    void clear() {
-        matrix.beginDraw();
-        matrix.clear();
-        matrix.endDraw();
-    }
-private:
-    ArduinoLEDMatrix matrix;
-};
-
-// --- Global Objects ---
-WiFiClient wifiClient;
-PubSubClient client(wifiClient);
-MatrixDisplay ledDisplay;
+// =================================================================
+// --- ⚙️ CONFIGURATION ---
+// =================================================================
 
 // --- Pin Definitions ---
-const byte irSensorPin_Tea = 11;
-const byte irSensorPin_Honey = 12;
-//const byte switchPin = 8;
-const byte relayPin_TeaMaterial = 2;
-const byte relayPin_HoneyMaterial = 4;
-const byte relayPin_SealBag = 3;
-const byte Gate = 10;
+const byte IR_SENSOR_PIN_TEA = 11;
+const byte IR_SENSOR_PIN_HONEY = 12;
+const byte START_SWITCH_PIN = 8;
+const byte RELAY_PIN_TEA = 2;
+const byte RELAY_PIN_HONEY = 4;
+const byte RELAY_PIN_SEAL = 3;
 
-// --- Operation Mode ---
-const bool SIMULTANEOUS_MODE = true;
+// --- Operational Parameters ---
+const unsigned long DISPENSE_TIMEOUT = 10000; // ms
+const unsigned long SEALING_DURATION = 300;   // ms
+const unsigned long POST_CYCLE_DELAY = 1000;  // ms
+const unsigned long DEBOUNCE_DELAY = 50;      // ms for ISR
+const int BATCH_SIZE = 24;
+
+// =================================================================
+// --- Global Objects & Variables ---
+// =================================================================
+
+WiFiClient wifiClient;
+PubSubClient client(wifiClient);
+
+enum MachineState { IDLE, DISPENSING, SEALING, POST_CYCLE_WAIT, ERROR_STATE };
+MachineState currentState = IDLE;
+
+// --- State Tracking Variables ---
+bool isTeaDispensed = false;
+bool isHoneyDispensed = false;
+unsigned long stateTimer = 0;
+unsigned long dispenseTimeoutTimer = 0;
+unsigned long pulseTimer = 0;
+bool isPulsing = false;
+
+// --- Interrupt Flags (must be volatile) ---
 volatile bool teaSensorTriggered = false;
 volatile bool honeySensorTriggered = false;
 volatile unsigned long lastTeaInterrupt = 0;
 volatile unsigned long lastHoneyInterrupt = 0;
-const unsigned long debounceDelay = 50;
 
-bool teaRelayRunning = true;
-bool honeyRelayRunning = true;
+// --- Counters ---
+unsigned int currentBatchCount = 0;
+unsigned long totalCount = 0;
+unsigned int batchNumber = 0;
 
-int TeaState = 0;
-int HoneyState = 0;
+// =================================================================
+// --- ⚡ Interrupt Service Routines (ISRs) ---
+// =================================================================
 
-unsigned int count = 0;
-unsigned long total_Count = 0;
-unsigned int batch = 0;
-bool connectionOk = false;
-bool sequenceInProgress = false;
-
-// --- Interrupts ---
 void teaSensorISR() {
-    if (millis() - lastTeaInterrupt > debounceDelay) {
+    if (millis() - lastTeaInterrupt > DEBOUNCE_DELAY) {
         teaSensorTriggered = true;
         lastTeaInterrupt = millis();
     }
 }
+
 void honeySensorISR() {
-    if (millis() - lastHoneyInterrupt > debounceDelay) {
+    if (millis() - lastHoneyInterrupt > DEBOUNCE_DELAY) {
         honeySensorTriggered = true;
         lastHoneyInterrupt = millis();
     }
 }
 
-// --- Telemetry ---
+// =================================================================
+// --- 📡 Network & Telemetry Functions ---
+// =================================================================
+
+void connectWiFi() {
+    Serial.print("Connecting to WiFi...");
+    WiFi.begin(WLAN_SSID, WLAN_PASS);
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 20) {
+        delay(500);
+        Serial.print(".");
+        retries++;
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+        Serial.println("\nWiFi connected!");
+        Serial.print("IP: ");
+        Serial.println(WiFi.localIP());
+    } else {
+        Serial.println("\nWiFi connection FAILED");
+    }
+}
+
+void connectMQTT() {
+    if (client.connected()) return;
+    Serial.print("Connecting to ThingsBoard as '");
+    Serial.print(MACHINE_ID);
+    Serial.print("'... ");
+    
+    if (client.connect(MACHINE_ID, THINGSBOARD_TOKEN, NULL)) {
+        Serial.println("Connected!");
+    } else {
+        Serial.print("MQTT Failed, rc=");
+        Serial.println(client.state());
+        delay(2000);
+    }
+}
+
+void checkConnections() {
+    if (currentState == ERROR_STATE) return;
+    if (WiFi.status() != WL_CONNECTED) {
+        connectWiFi();
+        return;
+    }
+    if (!client.connected()) {
+        connectMQTT();
+    }
+    client.loop();
+}
+
 void publishTelemetry() {
     if (!client.connected()) return;
+
     StaticJsonDocument<128> doc;
-    //doc["count"] = count;
-    doc["total_Count"] = total_Count;
-    doc["batch"] = batch;
+    doc["machine_id"] = MACHINE_ID; // Add machine ID to telemetry payload
+    doc["total_Count"] = totalCount;
+    doc["batch"] = batchNumber;
+
     char telemetry[128];
     serializeJson(doc, telemetry);
     client.publish("v1/devices/me/telemetry", telemetry);
+    Serial.println("Telemetry Published.");
 }
 
-// --- MQTT Connect ---
-void MQTT_connect() {
-    if (client.connected()) return;
-    Serial.print("Connecting to ThingsBoard... ");
-    uint8_t retries = 3;
-    while (!client.connected() && retries > 0) {
-        if (client.connect("arduino-client", TOKEN, NULL)) {
-            Serial.println("Connected!");
-            connectionOk = true;
-        } else {
-            Serial.print("MQTT Failed, rc = ");
-            Serial.println(client.state());
-            delay(5000);
-            retries--;
-        }
-    }
-    connectionOk = client.connected();
-}
+// =================================================================
+// --- ⚙️ Main Setup ---
+// =================================================================
 
-// --- Setup ---
 void setup() {
     Serial.begin(9600);
-    delay(10);
-    ledDisplay.begin("Starting...");
+    while (!Serial);
+    Serial.println("--- Automated Packager Initializing ---");
+    Serial.print("Machine ID: ");
+    Serial.println(MACHINE_ID);
 
-    pinMode(irSensorPin_Tea, INPUT_PULLUP);
-    pinMode(irSensorPin_Honey, INPUT_PULLUP);
-    pinMode(8, INPUT_PULLUP);
-    pinMode(relayPin_TeaMaterial, OUTPUT);
-    pinMode(relayPin_HoneyMaterial, OUTPUT);
-    pinMode(relayPin_SealBag, OUTPUT);
-    //pinMode(Gate, OUTPUT);
+    pinMode(IR_SENSOR_PIN_TEA, INPUT_PULLUP);
+    pinMode(IR_SENSOR_PIN_HONEY, INPUT_PULLUP);
+    pinMode(START_SWITCH_PIN, INPUT_PULLUP);
+    pinMode(RELAY_PIN_TEA, OUTPUT);
+    pinMode(RELAY_PIN_HONEY, OUTPUT);
+    pinMode(RELAY_PIN_SEAL, OUTPUT);
 
-    digitalWrite(relayPin_TeaMaterial, HIGH);
-    digitalWrite(relayPin_HoneyMaterial, HIGH);
-    digitalWrite(relayPin_SealBag, HIGH);
-    //digitalWrite(Gate, HIGH);
+    digitalWrite(RELAY_PIN_TEA, HIGH);
+    digitalWrite(RELAY_PIN_HONEY, HIGH);
+    digitalWrite(RELAY_PIN_SEAL, HIGH);
 
-    attachInterrupt(digitalPinToInterrupt(irSensorPin_Tea), teaSensorISR, FALLING);
-    attachInterrupt(digitalPinToInterrupt(irSensorPin_Honey), honeySensorISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN_TEA), teaSensorISR, FALLING);
+    attachInterrupt(digitalPinToInterrupt(IR_SENSOR_PIN_HONEY), honeySensorISR, FALLING);
 
-    WiFi.begin(WLAN_SSID, WLAN_PASS);
-    int wifi_retries = 0;
-    while (WiFi.status() != WL_CONNECTED && wifi_retries < 20) {
-        delay(500);
-        Serial.print(".");
-        wifi_retries++;
+    connectWiFi();
+    if (WiFi.status() == WL_CONNECTED) {
+        client.setServer(THINGSBOARD_SERVER, THINGSBOARD_SERVERPORT);
+        connectMQTT();
     }
-    connectionOk = WiFi.status() == WL_CONNECTED;
-    if (connectionOk) {
-        Serial.println("WiFi connected!");
-        Serial.print("IP: ");
-        Serial.println(WiFi.localIP());
-    }
-    client.setServer(THINGSBOARD_SERVER, THINGSBOARD_SERVERPORT);
-    Serial.println("Setup complete!");
+    
+    Serial.println("Setup Complete. System is IDLE.");
 }
 
-// --- Loop ---
+// =================================================================
+// --- 🔁 Main Loop (State Machine) ---
+// =================================================================
+
 void loop() {
-    if (!connectionOk || WiFi.status() != WL_CONNECTED) {
-        connectionOk = false;
-        ledDisplay.updateScroll("   Connection Failed   ");
-        delay(500);
-        WiFi.begin(WLAN_SSID, WLAN_PASS);
-        return;
-    }
-    client.loop();
-    MQTT_connect();
-    if (!client.connected()) {
-        ledDisplay.updateScroll("   MQTT Failed   ");
-        return;
-    }
-    ledDisplay.clear();
+    checkConnections();
+   
 
-    if(digitalRead(8)==LOW)
-    {
+    switch (currentState) {
+        case IDLE:
+            if (digitalRead(START_SWITCH_PIN) == LOW) {  //digitalRead(START_SWITCH_PIN) == LOW
+                Serial.println("Start signal received. Preparing to dispense.");
 
-    if (!sequenceInProgress) {
-        sequenceInProgress = true;
-        Serial.println("Starting material dispensing sequence...");
-        digitalWrite(relayPin_TeaMaterial, LOW);
-        digitalWrite(relayPin_SealBag, LOW);
-
-        teaRelayRunning = (TeaState == 0);
-        honeyRelayRunning = (HoneyState == 0);
-
-        // Step 1: Activate only relays that still need to run
-        if (teaRelayRunning) digitalWrite(relayPin_TeaMaterial, LOW);
-        if (honeyRelayRunning) digitalWrite(relayPin_HoneyMaterial, LOW);
-        delay(500); // run for 1 second
-
-        // Step 2: Turn off any that triggered during that second
-        if (teaSensorTriggered && teaRelayRunning) {
-            digitalWrite(relayPin_TeaMaterial, HIGH);
-            teaRelayRunning = false;
-            TeaState = 1;
-            Serial.println("✅ Tea detected during initial run - relay OFF");
-        }
-        if (honeySensorTriggered && honeyRelayRunning) {
-            digitalWrite(relayPin_HoneyMaterial, HIGH);
-            honeyRelayRunning = false;
-            HoneyState = 1;
-            Serial.println("✅ Honey detected during initial run - relay OFF");
-        }
-
-        // Step 3: Monitor until both detected or timeout
-        unsigned long startTime = millis();
-        unsigned long timeout = 5000;
-        while ((TeaState == 0 || HoneyState == 0) && (millis() - startTime < timeout)) {
-            if (teaSensorTriggered && teaRelayRunning) {
-                digitalWrite(relayPin_TeaMaterial, HIGH);
-                teaRelayRunning = false;
-                TeaState = 1;
-                Serial.println("✅ Tea detected - relay OFF");
+                 digitalWrite(RELAY_PIN_SEAL, LOW);
+                
+                isTeaDispensed = false;
+                isHoneyDispensed = false;
+                teaSensorTriggered = false;
+                honeySensorTriggered = false;
+                
+                isPulsing = false;
+                pulseTimer = millis() - 1001;
+                
+                dispenseTimeoutTimer = millis();
+                
+                currentState = DISPENSING;
             }
-            if (honeySensorTriggered && honeyRelayRunning) {
-                digitalWrite(relayPin_HoneyMaterial, HIGH);
-                honeyRelayRunning = false;
-                HoneyState = 1;
-                Serial.println("✅ Honey detected - relay OFF");
+            break;
+
+        case DISPENSING:
+            if (teaSensorTriggered && !isTeaDispensed) {
+                isTeaDispensed = true;
+                digitalWrite(RELAY_PIN_TEA, HIGH);
+                teaSensorTriggered = false;
+                Serial.println("✅ Tea dispensed. Relay is now permanently OFF.");
             }
-            delay(10);
-        }
+            if (honeySensorTriggered && !isHoneyDispensed) {
+                isHoneyDispensed = true;
+                digitalWrite(RELAY_PIN_HONEY, HIGH);
+                honeySensorTriggered = false;
+                Serial.println("✅ Honey dispensed. Relay is now permanently OFF.");
+            }
 
-        // Step 4: Safety shutoff
-        if (teaRelayRunning) {
-            digitalWrite(relayPin_TeaMaterial, HIGH);
-            Serial.println("❌ Tea not detected — relay OFF after timeout");
-        }
-        if (honeyRelayRunning) {
-            digitalWrite(relayPin_HoneyMaterial, HIGH);
-            Serial.println("❌ Honey not detected — relay OFF after timeout");
-        }
+            if (isTeaDispensed && isHoneyDispensed) {
+                Serial.println("Both materials dispensed. Moving to SEALING state.");
+                digitalWrite(RELAY_PIN_TEA, HIGH);
+                digitalWrite(RELAY_PIN_HONEY, HIGH);
+                currentState = SEALING;
+                stateTimer = millis();
+                digitalWrite(RELAY_PIN_SEAL, LOW);
+                break;
+            }
+            
+            if (millis() - dispenseTimeoutTimer > DISPENSE_TIMEOUT) {
+                Serial.println("❌ DISPENSING TIMEOUT!");
+                digitalWrite(RELAY_PIN_TEA, HIGH);
+                digitalWrite(RELAY_PIN_HONEY, HIGH);
+                currentState = ERROR_STATE;
+                break;
+            }
 
-        // Step 5: Seal if both detected
-        if (TeaState == 1 && HoneyState == 1) {
-            Serial.println("Both materials confirmed - sealing bag...");
-            digitalWrite(relayPin_SealBag, LOW);
-            delay(300);
-            digitalWrite(relayPin_SealBag, HIGH);
+            if (millis() - pulseTimer > 1000) {
+                pulseTimer = millis();
+                isPulsing = !isPulsing;
 
-            ++count;
-            ++total_Count;
-            publishTelemetry(); // turn off temp to gave ding instead of 25 dings
-            if (count >= 24) {
-                count = 0;
-                ++batch;
+                if (isPulsing) {
+                    Serial.println("PULSE ON");
+                    if (!isTeaDispensed) digitalWrite(RELAY_PIN_TEA, LOW);
+                    if (!isHoneyDispensed) digitalWrite(RELAY_PIN_HONEY, LOW);
+                } else {
+                    Serial.println("PULSE OFF (Pause)");
+                    digitalWrite(RELAY_PIN_TEA, HIGH);
+                    digitalWrite(RELAY_PIN_HONEY, HIGH);
+                }
+            }
+            break;
+
+        case SEALING:
+            if (millis() - stateTimer > SEALING_DURATION) {
+                digitalWrite(RELAY_PIN_SEAL, HIGH);
+                Serial.println("Sealing complete.");
+                
+                totalCount++;
+                currentBatchCount++;
+                if (currentBatchCount >= BATCH_SIZE) {
+                    currentBatchCount = 0;
+                    batchNumber++;
+                }
                 publishTelemetry();
+                
+                stateTimer = millis();
+                currentState = POST_CYCLE_WAIT;
             }
-            // Reset states after sealing
-            TeaState = 0;
-            HoneyState = 0;
-        } else {
-            Serial.println("❌ Package incomplete - materials missing");
-        }
+            break;
 
-        teaSensorTriggered = false;
-        honeySensorTriggered = false;
-        sequenceInProgress = false;
-        delay(2500);
+        case POST_CYCLE_WAIT:
+            if (millis() - stateTimer > POST_CYCLE_DELAY) {
+                Serial.println("Post-cycle wait finished. Returning to IDLE.");
+                currentState = IDLE;
+            }
+            break;
+            
+        case ERROR_STATE:
+            static bool errorDisplayed = false;
+            if (!errorDisplayed) {
+                Serial.println("System Halted in ERROR_STATE. Please reset the Arduino.");
+                errorDisplayed = true;
+            }
+            break;
     }
-    }
-
-    static unsigned long lastDebugPrint = 0;
-    if (millis() - lastDebugPrint > 2000) {
-        Serial.print("Count: ");
-        Serial.print(count);
-        Serial.print(" | Total: ");
-        Serial.print(total_Count);
-        Serial.print(" | Batch: ");
-        Serial.print(batch);
-        Serial.print(" | TeaState: ");
-        Serial.print(TeaState);
-        Serial.print(" | HoneyState: ");
-        Serial.println(HoneyState);
-        lastDebugPrint = millis();
-    }
-
-    delay(50); // small loop delay
 }
