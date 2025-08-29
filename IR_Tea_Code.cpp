@@ -174,13 +174,14 @@ void setup() {
 void loop() {
     checkConnections();
    
+   digitalWrite(RELAY_PIN_SEAL, LOW);
 
     switch (currentState) {
         case IDLE:
             if (digitalRead(START_SWITCH_PIN) == LOW) {  //digitalRead(START_SWITCH_PIN) == LOW
                 Serial.println("Start signal received. Preparing to dispense.");
 
-                 digitalWrite(RELAY_PIN_SEAL, LOW);
+                 
                 
                 isTeaDispensed = false;
                 isHoneyDispensed = false;
