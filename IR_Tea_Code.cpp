@@ -108,6 +108,8 @@ void connectMQTT() {
 }
 
 void checkConnections() {
+    digitalWrite(RELAY_PIN_SEAL, LOW); //stop the seal from keep going
+
     if (currentState == ERROR_STATE) return;
     if (WiFi.status() != WL_CONNECTED) {
         connectWiFi();
@@ -173,16 +175,14 @@ void setup() {
 
 void loop() {
     checkConnections();
-   
-   digitalWrite(RELAY_PIN_SEAL, LOW);
+   //delay(500); //slow machine down
+   digitalWrite(RELAY_PIN_SEAL, LOW); //stop the seal from keep going
 
     switch (currentState) {
         case IDLE:
             if (digitalRead(START_SWITCH_PIN) == LOW) {  //digitalRead(START_SWITCH_PIN) == LOW
                 Serial.println("Start signal received. Preparing to dispense.");
 
-                 
-                
                 isTeaDispensed = false;
                 isHoneyDispensed = false;
                 teaSensorTriggered = false;
@@ -199,15 +199,23 @@ void loop() {
 
         case DISPENSING:
             if (teaSensorTriggered && !isTeaDispensed) {
+                // NEW: Wait in a loop until the sensor is no longer blocked (goes HIGH)
+                while (digitalRead(IR_SENSOR_PIN_TEA) == LOW) {
+                    delay(50); // Pause to prevent hammering the CPU
+                }
                 isTeaDispensed = true;
                 digitalWrite(RELAY_PIN_TEA, HIGH);
-                teaSensorTriggered = false;
+                teaSensorTriggered = false; // Reset the interrupt flag
                 Serial.println("✅ Tea dispensed. Relay is now permanently OFF.");
             }
             if (honeySensorTriggered && !isHoneyDispensed) {
+                // NEW: Wait in a loop until the sensor is no longer blocked (goes HIGH)
+                while (digitalRead(IR_SENSOR_PIN_HONEY) == LOW) {
+                    delay(50); // Pause to prevent hammering the CPU
+                }
                 isHoneyDispensed = true;
                 digitalWrite(RELAY_PIN_HONEY, HIGH);
-                honeySensorTriggered = false;
+                honeySensorTriggered = false; // Reset the interrupt flag
                 Serial.println("✅ Honey dispensed. Relay is now permanently OFF.");
             }
 
@@ -255,6 +263,9 @@ void loop() {
                 if (currentBatchCount >= BATCH_SIZE) {
                     currentBatchCount = 0;
                     batchNumber++;
+                    //pinMode(9, HIGH);
+                    //delay(1000);
+                    //pinMode(9, LOW);
                 }
                 publishTelemetry();
                 
